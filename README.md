@@ -1,10 +1,10 @@
 # DNSServer
 
-The program (Makefile produces an executable named ’dns_svr’.) accepts DNS “AAAA” query over TCP on port 8053. Forward it to a server whose IPv4 address is the first command-line argument and whose port is the second command-line argument. Send the response back to the client who sent the request, over the same TCP connection. There will be a separate TCP connection for each query/response with the client. 
+The program (makefile produces an executable named ’dns_svr’.) accepts DNS “AAAA” query over TCP on port 8053. Forward it to a server whose IPv4 address is the first command-line argument and whose port is the second command-line argument. Send the response back to the client who sent the request, over the same TCP connection. There will be a separate TCP connection for each query/response with the client. 
   
 Input example:  
-./dns_svr (input address) (input port)  
-dig +tcp @(input host) -p(input port) AAAA google.com  
+Server: ./dns_svr (input address) (input port)  
+dig +tcp @(input address) -p(input port) AAAA google.com  
   
 Log will keep a log at ./dns_svr.log (i.e., in current directory) with messages of the following format:  
 <timestamp> requested <domain_name> – when you receive a request  
