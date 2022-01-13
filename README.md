@@ -4,7 +4,7 @@ This program (makefile produces an executable named ’dns_svr’.) accepts DNS 
   
 Input example:  
 Server: ./dns_svr (uper server address) (upper server port)  
-dig +tcp a(dns server address) -p(dns server port) AAAA google.com  
+Client: dig +tcp a(dns server address) -p(dns server port) AAAA google.com  
   
 Log will keep a log at ./dns_svr.log (i.e., in current directory) with messages of the following format:  
 <timestamp> requested <domain_name> – when dns server receive a request  
