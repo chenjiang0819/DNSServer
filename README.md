@@ -7,9 +7,9 @@ Server: ./dns_svr (uper server address) (upper server port)
 dig +tcp a(dns server address) -p(dns server port) AAAA google.com  
   
 Log will keep a log at ./dns_svr.log (i.e., in current directory) with messages of the following format:  
-<timestamp> requested <domain_name> – when you receive a request  
+<timestamp> requested <domain_name> – when dns server receive a request  
 <timestamp> unimplemented request – if the request type is not AAAA  
-<timestamp> <domain_name> expires at <timestamp> – for each request you receive that is in yourcache  
+<timestamp> <domain_name> expires at <timestamp> – for each request the dns server receive that is in the cache  
 <timestamp> replacing <domain_name> by <domain_name> – for each cache eviction  
 <timestamp> <domain_name> is at <IP address>  
   
