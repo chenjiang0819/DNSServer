@@ -1,25 +1,26 @@
-dns_svr: dns_svr.o downstream_svr.o upstream_svr.o svr_cache.o svr_log.o
-	gcc -o dns_svr dns_svr.o downstream_svr.o upstream_svr.o svr_cache.o svr_log.o -Wall -lm -g -lpthread
+CC ?= cc
+CFLAGS ?= -std=gnu99 -O2 -Wall -Wextra -Wpedantic
+SOURCES = dns_svr.c downstream_svr.c upstream_svr.c svr_cache.c svr_log.c
+HEADERS = downstream_svr.h upstream_svr.h svr_cache.h svr_log.h
 
-dns_svr.o: dns_svr.c downstream_svr.h upstream_svr.h downstream_svr.h svr_cache.h svr_log.h
-	gcc -c  dns_svr.c downstream_svr.h upstream_svr.h downstream_svr.h svr_log.h -Wall -lm -g -lpthread
+dns_svr: $(SOURCES) $(HEADERS)
+	$(CC) $(CFLAGS) $(SOURCES) -pthread -o $@
 
-downstream_svr.o: downstream_svr.c downstream_svr.h svr_log.h
-	gcc -c  downstream_svr.c downstream_svr.h svr_log.h -Wall -lm -g -lpthread
+test: dns_svr .build/test-parser
+	./.build/test-parser
+	python3 -B -m unittest discover -s tests -v
 
-upstream_svr.o: upstream_svr.c upstream_svr.h svr_log.h
-	gcc -c  upstream_svr.c upstream_svr.h -Wall svr_log.h -lm -g -lpthread
+.build/test-parser: tests/test_parser.c svr_log.c svr_log.h
+	mkdir -p .build
+	$(CC) $(CFLAGS) tests/test_parser.c svr_log.c -o $@
 
-svr_cache.o: svr_cache.c svr_cache.h svr_log.h
-	gcc -c  svr_cache.c svr_cache.h svr_log.h -Wall -lm -g -lpthread
-
-svr_log.o: svr_log.c svr_log.h
-	gcc -c  svr_log.c svr_log.h -Wall -lm -g -lpthread
+sanitize:
+	mkdir -p .build
+	$(CC) -std=gnu99 -O1 -g -Wall -Wextra -Wpedantic -fsanitize=address,undefined -fno-omit-frame-pointer $(SOURCES) -pthread -o .build/dns-sanitize
+	$(CC) -std=gnu99 -O1 -g -Wall -Wextra -Wpedantic -fsanitize=address,undefined -fno-omit-frame-pointer tests/test_parser.c svr_log.c -o .build/parser-sanitize
+	./.build/parser-sanitize
+	PROGRAM=$(CURDIR)/.build/dns-sanitize python3 -B -m unittest discover -s tests -v
 
 clean:
 	rm -f dns_svr *.o *.gch
-
-
-
-
-
+.PHONY: test sanitize clean

@@ -1,134 +1,45 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <time.h>
-#include <string.h>
-
 #include "svr_cache.h"
-#include "upstream_svr.h"
-#include "svr_log.h"
-
-#define LEN_BYTE 2
-#define TIME_SIZE 80
-#define BUFFER 256
-#define TRUE 1
-#define FALSE 0
-#define INITIAL 0
-#define RP -1
-#define REC 1
-#define CACHE_NUM 5
-#define PKT_ID_1 2
-#define PKT_ID_2 3
-
-/****************************************************************/
-
-// update and push new tuples into the cache
-void push_cache(FILE* fp, unsigned char** server_cache,unsigned char* res_buffer, unsigned char* rp_buffer ,time_t expire_time[CACHE_NUM][LEN_BYTE]){
-	int TTL_new = INITIAL, TTL_eviction = INITIAL;
-	int AAAA_check = FALSE, rp_check = FALSE, cacheable_check = FALSE, expired_exist = FALSE;
-	int pkt_kind = RP;
-	char address[BUFFER];
-	char new_domain[BUFFER];
-	char eviction_domain[BUFFER];
-	// get the current time
-	time_t current;
-	char time_buffer[TIME_SIZE];
-	current_time(time_buffer);
-	time(&current);
-	// analyse the response
-	analyse_pkt(rp_buffer, &AAAA_check, &rp_check, &cacheable_check, pkt_kind, &TTL_new, new_domain, address, INITIAL);
-	for(int i = 0; i < CACHE_NUM; i++){
-		if(current >= expire_time[i][1] && expire_time[i][1] >= INITIAL){		
-			analyse_pkt(server_cache[i], &AAAA_check, &rp_check, &cacheable_check, pkt_kind, &TTL_eviction, eviction_domain, address, INITIAL);                                                                          
-			// record the new tuple
-			free(server_cache[i]);
-			server_cache[i] = NULL;
-			server_cache[i] = rp_buffer;
-			expire_time[i][0] = current;
-			expire_time[i][1] = current + TTL_new;
-			expired_exist = TRUE;
-			// write the records into the log
-			fprintf(fp,"%s replacing %s by %s\n",time_buffer, eviction_domain, new_domain);
-			fflush(fp);
-			break;
-		}
-	}
-	if(expired_exist == FALSE){		
-		if(server_cache[INITIAL] != NULL){
-			// anaylse the eviction record
-			analyse_pkt(server_cache[INITIAL], &AAAA_check, &rp_check, &cacheable_check, pkt_kind, &TTL_eviction, eviction_domain, address, INITIAL);                                                                          
-			// write the records into the log
-			fprintf(fp,"%s replacing %s by %s\n",time_buffer, eviction_domain, new_domain);
-			fflush(fp);
-			free(server_cache[INITIAL]);
-			server_cache[INITIAL] = NULL;
-		}
-		// insert the response
-		server_cache[0] = server_cache[1];
-		server_cache[1] = server_cache[2];
-		server_cache[2] = server_cache[3];
-		server_cache[3] = server_cache[4];
-		server_cache[4] = rp_buffer;
-		// insert the response time
-		expire_time[0][0] = expire_time[1][0];
-		expire_time[0][1] = expire_time[1][1];
-		expire_time[1][0] = expire_time[2][0];
-		expire_time[1][1] = expire_time[2][1];
-		expire_time[2][0] = expire_time[3][0];
-		expire_time[2][1] = expire_time[3][1];
-		expire_time[3][0] = expire_time[4][0];
-		expire_time[3][1] = expire_time[4][1];
-		expire_time[4][0] = INITIAL;
-		expire_time[4][0] = current;
-		expire_time[4][1] = INITIAL;
-		expire_time[4][1] = current + TTL_new; 
-	}
+#include <stdlib.h>
+#include <string.h>
+static void clear(cache_entry *entry) {free(entry->request);free(entry->response);memset(entry,0,sizeof(*entry));}
+void free_cache(cache_entry cache[CACHE_NUM]) {for(int i=0;i<CACHE_NUM;i++)clear(&cache[i]);}
+static int matches(const cache_entry *entry,const unsigned char *request,size_t length) {
+    /* Full request equality apart from transaction ID. Preserves flags and EDNS semantics. */
+    return entry->request && entry->request_length==length && !memcmp(entry->request,request,2) && !memcmp(entry->request+4,request+4,length-4);
 }
-
-// check the existed tuples into the cache
-void check_cache(FILE *fp, unsigned char** server_cache, unsigned char* res_buffer, int* cache_check, int newsockfd, time_t expire_time[CACHE_NUM][LEN_BYTE]){
-	int TTL = INITIAL, time_diff = INITIAL;
-	int pkt_kind;
-	int AAAA_check = FALSE, rp_check = FALSE, cacheable_check = FALSE;
-	time_t current;
-	char expire_time_in_char [TIME_SIZE];
-	char cache_domain[BUFFER];
-	char address[BUFFER];
-	char new_domain[BUFFER];
-	int msg_len = INITIAL;
-	// gather the information from lient
-	pkt_kind = REC;
-	analyse_pkt(res_buffer, &AAAA_check, &rp_check, &cacheable_check, pkt_kind, &TTL, new_domain, address, INITIAL);
-	// check the cache
-	pkt_kind = RP;
-	for(int i = 0; i < CACHE_NUM; i++){
-		if(server_cache[i] != NULL){
-			rp_check = FALSE;
-			*cache_check = FALSE;
-			time(&current);
-			time_diff = current - expire_time[i][0];			
-			analyse_pkt(server_cache[i], &AAAA_check, &rp_check, &cacheable_check, pkt_kind, &TTL, cache_domain, address, time_diff);	
-			if(strcmp(new_domain, cache_domain) == 0  && TTL > INITIAL && (expire_time[i][1] - current) >= INITIAL){				
-				*cache_check = TRUE;
-				res_log_print(fp, new_domain);
-				// covert the expire time to required format
-				struct tm *info = localtime(&expire_time[i][1]); 
-				strftime(expire_time_in_char, TIME_SIZE, "%FT%T%z", info);
-				cache_log_print(fp, new_domain, expire_time_in_char); 
-				// get the length of the response
-				msg_len = server_cache[i][0] << 8;
-				msg_len = msg_len + server_cache[i][1];
-				// change the ID of the record 
-				server_cache[i][PKT_ID_1] = res_buffer[PKT_ID_1];
-				server_cache[i][PKT_ID_2] = res_buffer[PKT_ID_2];
-				// send response back to the client
-				msg_len = check_len(server_cache[i]);
-				send_pkt(newsockfd, server_cache[i], msg_len); 
-				// record the activity
-				if(rp_check == TRUE){
-					rp_log_print(fp, new_domain, address);
-				}
-				break;
-			}
-		}
-	}
+unsigned char *check_cache(FILE *fp,cache_entry cache[CACHE_NUM],const unsigned char *request,size_t length,size_t *response_length) {
+    time_t now=time(NULL);
+    for(int i=0;i<CACHE_NUM;i++) {
+        cache_entry *entry=&cache[i];
+        if(!entry->response)continue;
+        double elapsed=difftime(now,entry->inserted);
+        if(elapsed<0)elapsed=0;
+        if(elapsed>=entry->ttl){clear(entry);continue;}
+        if(!matches(entry,request,length))continue;
+        unsigned char *reply=malloc(entry->response_length);if(!reply)return NULL;
+        memcpy(reply,entry->response,entry->response_length);reply[2]=request[2];reply[3]=request[3];
+        uint32_t remaining=entry->ttl-(uint32_t)elapsed;size_t pos=entry->ttl_offset;
+        reply[pos]=(unsigned char)(remaining>>24);reply[pos+1]=(unsigned char)(remaining>>16);reply[pos+2]=(unsigned char)(remaining>>8);reply[pos+3]=(unsigned char)remaining;
+        *response_length=entry->response_length;
+        dns_info info;if(analyse_pkt(reply,*response_length,&info)) {
+            char expires[80];struct tm tm;time_t when=now+(time_t)remaining;
+            if(localtime_r(&when,&tm) && strftime(expires,sizeof(expires),"%FT%T%z",&tm))cache_log_print(fp,info.domain,expires);
+            rp_log_print(fp,info.domain,info.address);
+        }
+        return reply;
+    }
+    return NULL;
+}
+int push_cache(FILE *fp,cache_entry cache[CACHE_NUM],const unsigned char *request,size_t request_length,const unsigned char *reply,size_t reply_length,const dns_info *info) {
+    cache_entry fresh={0};fresh.request=malloc(request_length);fresh.response=malloc(reply_length);
+    if(!fresh.request || !fresh.response){clear(&fresh);return 0;}
+    memcpy(fresh.request,request,request_length);memcpy(fresh.response,reply,reply_length);
+    fresh.request_length=request_length;fresh.response_length=reply_length;fresh.ttl_offset=info->ttl_offset;fresh.ttl=info->ttl;fresh.inserted=time(NULL);
+    for(int i=0;i<CACHE_NUM;i++) {
+        if(matches(&cache[i],request,request_length) || !cache[i].response || difftime(fresh.inserted,cache[i].inserted)>=cache[i].ttl) {clear(&cache[i]);cache[i]=fresh;return 1;}
+    }
+    dns_info old;if(analyse_pkt(cache[0].response,cache[0].response_length,&old)) {
+        char stamp[80];current_time(stamp);fprintf(fp,"%s replacing %s by %s\n",stamp,old.domain,info->domain);fflush(fp);
+    }
+    clear(&cache[0]);memmove(cache,cache+1,(CACHE_NUM-1)*sizeof(*cache));cache[CACHE_NUM-1]=fresh;return 1;
 }
