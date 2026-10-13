@@ -1,143 +1,78 @@
-#include <stdio.h>
-#include <stdlib.h>
+#include "svr_log.h"
+#include <string.h>
 #include <time.h>
 #include <arpa/inet.h>
 
-#include "svr_log.h"
+static uint16_t u16(const unsigned char *p) {return (uint16_t)(((unsigned)p[0]<<8)|p[1]);}
+static uint32_t u32(const unsigned char *p) {return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];}
+int check_len(const unsigned char *packet) {return u16(packet);}
 
-#define LEN_BYTE 2
-#define TIME_SIZE 80
-#define BUFFER 256
-#define STOP_POINT 1
-#define TRUE 1
-#define FALSE 0
-#define INITIAL 0
-#define RP -1
-#define REC 1
-#define DOMAIN_START 14
-#define AAAA 28
-
-/****************************************************************/
-
-// check the length of a received pkt 
-int check_len(unsigned char* PKT){
-	int len = INITIAL;
-	len = PKT[0] << 8;
-	len = len + PKT[1];
-	return len;
+/* Decode a DNS name manually; bounded pointer following rejects cycles.
+ * start/end refer to the DNS message, excluding its two-byte TCP prefix. */
+static int name(const unsigned char *p,size_t n,size_t start,size_t *end,char *out) {
+    size_t pos=start,used=0,hops=0;int jumped=0;
+    while(pos<n && hops++<=n) {
+        unsigned c=p[pos++];
+        if((c&0xc0)==0xc0) {
+            if(pos>=n)return 0;
+            size_t target=((size_t)(c&0x3f)<<8)|p[pos++];
+            if(!jumped)*end=pos;
+            jumped=1;pos=target;continue;
+        }
+        if(c&0xc0 || c>63 || pos+c>n)return 0;
+        if(!c) {
+            if(!jumped)*end=pos;
+            if(out){if(!used)out[used++]='.';out[used]=0;}
+            return 1;
+        }
+        if(used+(used?1:0)+c>253)return 0;
+        if(used && out)out[used]='.';
+        if(used)used++;
+        for(unsigned i=0;i<c;i++) {
+            unsigned byte=p[pos++];
+            if(out)out[used]=(byte>32 && byte<127 && byte!='\\')?(char)byte:'_';
+            used++;
+        }
+    }
+    return 0;
 }
-
-// check current time
-void current_time(char* time_buffer){
-	time_t rawtime;
-	struct tm *info;
-	time(&rawtime);
-	info = localtime(&rawtime);
-	strftime(time_buffer, TIME_SIZE, "%FT%T%z", info);
+int analyse_pkt(const unsigned char *packet,size_t length,dns_info *info) {
+    memset(info,0,sizeof(*info));
+    if(length<14 || (size_t)check_len(packet)+2!=length)return 0;
+    const unsigned char *p=packet+2;size_t n=length-2,end=0;
+    info->flags=u16(p+2);
+    if(u16(p+4)!=1 || !name(p,n,12,&end,info->domain) || end+4>n)return 0;
+    info->type=u16(p+end);info->class_code=u16(p+end+2);end+=4;
+    info->question_end=end+2;
+    unsigned answers=u16(p+6),authority=u16(p+8),additional=u16(p+10);
+    unsigned count=answers+authority+additional;
+    for(unsigned i=0;i<count;i++) {
+        if(!name(p,n,end,&end,NULL) || end+10>n)return 0;
+        unsigned type=u16(p+end),class_code=u16(p+end+2),rdlen=u16(p+end+8);
+        uint32_t ttl=u32(p+end+4);
+        if(end+10+rdlen>n || (type==28 && rdlen!=16))return 0;
+        /* Cache only a complete single-AAAA response: no partial RR TTL aging. */
+        if(i==0 && answers==1 && authority==0 && additional==0 && type==28 && class_code==1 && ttl>0 && (info->flags&0x8000) && !(info->flags&0x020f)) {
+            info->cacheable=1;info->ttl=ttl;info->ttl_offset=end+6;
+            if(!inet_ntop(AF_INET6,p+end+10,info->address,sizeof(info->address)))return 0;
+        }
+        end+=10+rdlen;
+    }
+    return end==n;
 }
-
-// log the reply from upstream server
-void rp_log_print(FILE* fp, char *domain, char* address){
-	//stamp the time at the begining of a record
-	char time_buffer[TIME_SIZE];
-	current_time(time_buffer);
-	//write the records into the log
-	fprintf(fp,"%s %s is at %s\n",time_buffer, domain, address);
-	fflush(fp);
+void current_time(char *buffer) {
+    time_t now=time(NULL);struct tm info;
+    if(!localtime_r(&now,&info) || !strftime(buffer,80,"%FT%T%z",&info))strcpy(buffer,"unknown-time");
 }
-
-// log a normal request
-void res_log_print(FILE* fp,  char *domain){
-	//stamp the time at the begining of a record
-	char time_buffer[TIME_SIZE];
-	current_time(time_buffer);
-	//write the records into the log
-	fprintf(fp,"%s requested %s\n", time_buffer, domain);
-	fflush(fp);
+void rp_log_print(FILE *fp,const char *domain,const char *address) {
+    char stamp[80];current_time(stamp);fprintf(fp,"%s %s is at %s\n",stamp,domain,address);fflush(fp);
 }
-
-// log a unimplemented request
-void unimplemented_print(FILE* fp){
-	//stamp the time at the begining of a record
-	char time_buffer[TIME_SIZE];
-	current_time(time_buffer);
-	fprintf(fp,"%s unimplemented request\n",time_buffer);
-	fflush(fp);
+void res_log_print(FILE *fp,const char *domain) {
+    char stamp[80];current_time(stamp);fprintf(fp,"%s requested %s\n",stamp,domain);fflush(fp);
 }
-
-// log a cache operation
-void cache_log_print(FILE* fp, char *domain, char *expire_time){
-	//stamp the time at the begining of a record
-	char time_buffer[TIME_SIZE];
-	current_time(time_buffer);
-	//log the record
-	fprintf(fp,"%s %s expires at %s\n",time_buffer, domain, expire_time);
-	fflush(fp);
+void unimplemented_print(FILE *fp) {
+    char stamp[80];current_time(stamp);fprintf(fp,"%s unimplemented request\n",stamp);fflush(fp);
 }
-
-// writing a log
-void log_pkt(unsigned char* PKT, FILE* fp, int* AAAA_check, int* rp_check,  int* cacheable_check, int pkt_kind, char* domain, char* address){
-	int TTL = INITIAL;
-	int take_space;
-	*cacheable_check = FALSE;
-	// print out the records into the log
-	if(pkt_kind == REC){
-		analyse_pkt(PKT, AAAA_check, rp_check, cacheable_check, pkt_kind, &TTL, domain, address, INITIAL);
-		if(*AAAA_check == FALSE){
-			res_log_print(fp, domain);
-			unimplemented_print(fp);
-		}
-	}else{
-		analyse_pkt(PKT, &take_space, rp_check, cacheable_check, pkt_kind, &TTL, domain, address, INITIAL);		
-	}
-	
-}
-
-// analyse a pkt to get parameters 
-void analyse_pkt(unsigned char* PKT, int* AAAA_check, int* rp_check, int* cacheable_check, int pkt_kind, int* TTL, char* domain, char* address, int time_pass){
-	int start_point = DOMAIN_START;
-	int section_len = PKT[DOMAIN_START];
-	int current = INITIAL;
-	int address_len = INITIAL;
-	int i = INITIAL;
-	// translate the PKT to readable char
-	while(section_len != 0){
-		section_len = PKT[start_point];
-		for(current = 0; current < section_len; current++){
-			domain[i++] = PKT[start_point + current + STOP_POINT];
-		}
-		domain[i++] = '.';
-		start_point = start_point + section_len + STOP_POINT;
-	}
-	domain[i - LEN_BYTE] = '\0';
-	// check if the PKT is the AAAA
-	if(PKT[start_point] == 0 && PKT[start_point + STOP_POINT] == AAAA ){
-		*AAAA_check = TRUE;
-	}
-	if(pkt_kind == RP){
-		// check if  response is AAAA
-		start_point = start_point + 6;	
-		if(PKT[start_point] == 0 && PKT[start_point + STOP_POINT] == AAAA){
-			*rp_check = TRUE;		
-		}	
-		start_point = start_point + 4;
-		// reduce the TTL
-		PKT[start_point + 3] = PKT[start_point + 3] - time_pass;
-		// get the TTL
-		*TTL = INITIAL;
-		*TTL = PKT[start_point] << 24;
-		*TTL = *TTL + (PKT[start_point + 1] << 16);
-		*TTL = *TTL + (PKT[start_point + 2] << 8);
-		*TTL = *TTL + PKT[start_point + 3];
-		// check if  response is AAAA and non NULL		
-		start_point = start_point + 4;			
-		address_len = PKT[start_point] << 8;
-		address_len = address_len + PKT[++start_point];
-		if(address_len > 0){
-			*cacheable_check = TRUE;
-			start_point ++;
-			// record Ipv6 address	
-			inet_ntop(AF_INET6, PKT + start_point, address, BUFFER);
-		}
-	}
+void cache_log_print(FILE *fp,const char *domain,const char *expire) {
+    char stamp[80];current_time(stamp);fprintf(fp,"%s %s expires at %s\n",stamp,domain,expire);fflush(fp);
 }

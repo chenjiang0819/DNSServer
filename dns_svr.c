@@ -1,281 +1,104 @@
-/* 
- * This code is written by Chen Jiang (student ID: REDACTED_STUDENT_ID)
- * referred the material gaven in the practial class of COMP30023 Computer System 
- * at the University of Melbourne in semester 1 2021 
- * for Project2 of COMP30023 Computer System
- * from 05 May 2021 at the University of MElbourne
+/*
+ * Written by Chen Jiang for COMP30023 Computer Systems, University of Melbourne,
+ * semester 1, May 2021; socket setup refers to the course practical material.
+ * 2026 maintenance retains per-connection threads, manual DNS parsing and a
+ * five-entry cache, with explicit shared ownership and bounded transport I/O.
  */
-
 #include <stdio.h>
 #include <stdlib.h>
-#include <time.h>
-#include <ctype.h>
 #include <string.h>
-#include <assert.h>
+#include <errno.h>
 #include <pthread.h>
-
-#include <netdb.h>
+#include <signal.h>
+#include <poll.h>
 #include <unistd.h>
-#include <arpa/inet.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-
 #include "downstream_svr.h"
 #include "upstream_svr.h"
 #include "svr_cache.h"
 #include "svr_log.h"
 
-#define NONBLOCKING
-#define CACHE
-#define LEN_BYTE 2
-#define BUFFER 256
-#define STOP_POINT 1
-#define SERVER_PORT "8053"
-#define TRUE 1
-#define FALSE 0
-#define INITIAL 0
-#define RP -1
-#define REC 1
-#define CACHE_NUM 5
+typedef struct {
+    FILE *fp;
+    cache_entry cache[CACHE_NUM];
+    pthread_mutex_t mutex;
+    pthread_cond_t drained;
+    unsigned active;
+    const char *upstream_ip,*upstream_port;
+} server_state;
+struct mypara {int newsockfd;server_state *server;};
+static volatile sig_atomic_t stopping=0;
+static void stop_server(int signal_number) {
+    (void)signal_number;stopping=1;
 
-/****************************************************************/
-// create a struct to deliver the parameters into an operation function through pthread
-struct mypara{
-    FILE* fp; 
-	int newsockfd;
-	unsigned char *req_buffer;
-	unsigned char *rep_buffer;
-	unsigned char *server_cache[CACHE_NUM]; 
-	time_t expire_time[CACHE_NUM][LEN_BYTE];
-	char** argv_char;  
-	char* filename;
-};
-
-// check the length of a pkt before read it 
-int check_pkt_len(int newsockfd, unsigned char* pkt_len);
-// read a pkt from outside 
-void read_pkt(int msg_len, unsigned char* pkt_len, unsigned char* buffer, int sockfd);
-// create space for buffer
-unsigned char* create_space(int length, unsigned char* buffer);
-// create a API for using pthread
-void* API(void* delvry);
-// pack all process in one function to use the thread via API
-void process_req(FILE* fp, int newsockfd, unsigned char *req_buffer,unsigned char *rep_buffer, unsigned char *server_cache[CACHE_NUM], 
-	time_t expire_time[CACHE_NUM][LEN_BYTE], char** argv, char* filename);
-
-/****************************************************************/
-
-// main function
-int main(int argc, char *argv[]){
-	// setting the parameters 
-	int sockfd,  newsockfd;
-	unsigned char *req_buffer = NULL, *rep_buffer = NULL;
-	socklen_t client_addr_size;
-	struct addrinfo hints_myserver;
-	struct addrinfo *req_myserver = NULL;
-	struct sockaddr_storage client_addr;
-	struct mypara delvr;
-
-
-	// initialise the parameters
-	// initialise the cache
-	memset(delvr.server_cache, INITIAL, sizeof(delvr.server_cache));	
-	// initialise the expire_time;
-	for(int i = 0; i < CACHE_NUM; i++){
-		delvr.expire_time[i][0] = -1;
-		delvr.expire_time[i][1] = -1;
-	}
-
-	// open the log file under writing and reading mode
-	char* filename = "dns_svr.log";
-	FILE* fp = fopen(filename, "w");
-	if (fp == NULL) {
-		fprintf(stderr, "The log file is not opened\n");
-		exit(EXIT_FAILURE);
-	}
-
-	// to detect the incorrect input
-	if (argc < 3) {
-		fprintf(stderr, "The input is not correct\n");
-		exit(EXIT_FAILURE);
-	}
-
-	// setup and bind a socket on our server
-	setup_socket(hints_myserver, req_myserver, &sockfd);
-	
-	// to keep the scerver running
-	while(1){
-		// referred the materials gaven in the practial class
-		// Accept a connection - blocks until a connection is ready to be accepted
-		// Get back a new file descriptor to communicate on
-		client_addr_size = sizeof(client_addr);
-		newsockfd = accept(sockfd, (struct sockaddr*)&client_addr, &client_addr_size);
-		if (newsockfd < 0) {
-			perror("accept");
-			exit(EXIT_FAILURE);
-		}
-		// pack all parameters in the struct
-		delvr.fp = fp; 
-		delvr.filename = filename;
-		delvr.newsockfd = newsockfd;
-		delvr.req_buffer = req_buffer;
-		delvr.rep_buffer = rep_buffer;
-		delvr.argv_char = argv; 
-		// implement the thread
-		pthread_t tid;
-		pthread_create(&tid, NULL, API, (void*)&delvr);	
-	}
-	// free malloced places
-	for(int i = 0; i < CACHE_NUM; i++){
-		free(delvr.server_cache[i]);
-		delvr.server_cache[i] = NULL;
-	}
-	fclose(fp);
-	freeaddrinfo(req_myserver);
-	close(sockfd);
-	return 0;
 }
-/****************************************************************/
-// create a API for using pthread
-void* API(void* delvry){
-	struct mypara* delvr = (struct mypara*) delvry;
-	process_req(delvr -> fp, delvr -> newsockfd, delvr -> req_buffer, delvr -> rep_buffer, delvr -> server_cache, delvr -> expire_time, 
-						delvr -> argv_char, delvr -> filename);
-	pthread_exit(0);  
+static int valid_port(const char *text) {
+    if(!text || !*text)return 0;
+    unsigned value=0;
+    for(const char *p=text;*p;p++){if(*p<'0'||*p>'9')return 0;value=value*10+(unsigned)(*p-'0');if(value>65535)return 0;}
+    return value>0;
 }
-
-// check the length of a pkt before read it 
-int check_pkt_len(int newsockfd, unsigned char* pkt_len){
-	int msg_len = INITIAL;
-	int read_check = read(newsockfd,pkt_len,2);
-	if(read_check < 0){
-		perror("read");
-		exit(EXIT_FAILURE);
-	}
-	msg_len = check_len(pkt_len);
-	return msg_len;
+static int same_question(const unsigned char *q,size_t qn,const dns_info *qi,const unsigned char *r,size_t rn,const dns_info *ri) {
+    (void)qn;(void)rn;
+    return q[2]==r[2] && q[3]==r[3] && (ri->flags&0x8000) && (qi->flags&0x7800)==(ri->flags&0x7800) && qi->question_end==ri->question_end && !memcmp(q+14,r+14,qi->question_end-14);
 }
-
-// read a pkt from outside 
-void read_pkt(int msg_len, unsigned char* pkt_len, unsigned char* buffer, int sockfd){
-	int i = 2;
-	int read_check;
-	buffer[0] = pkt_len[0];
-	buffer[1] = pkt_len[1];
-	while(msg_len){
-		read_check = read(sockfd, buffer + i, 1);
-		if(read_check < 0){
-			perror("read");
-			exit(EXIT_FAILURE);
-		}
-		msg_len --;
-		i++;
-	}
+static void process_req(struct mypara *job) {
+    server_state *state=job->server;int fd=job->newsockfd,upstream=-1;
+    unsigned char *request=NULL,*reply=NULL;size_t request_length=0,reply_length=0;dns_info query,response;
+    if(!socket_timeout(fd) || !read_pkt(fd,&request,&request_length) || !analyse_pkt(request,request_length,&query) || (query.flags&0xf800))goto done;
+    pthread_mutex_lock(&state->mutex);res_log_print(state->fp,query.domain);pthread_mutex_unlock(&state->mutex);
+    if(query.type!=28 || query.class_code!=1) {
+        pthread_mutex_lock(&state->mutex);unimplemented_print(state->fp);pthread_mutex_unlock(&state->mutex);
+        send_pkt(fd,not_AAAA_rp(request),check_len(request));goto done;
+    }
+    pthread_mutex_lock(&state->mutex);reply=check_cache(state->fp,state->cache,request,request_length,&reply_length);pthread_mutex_unlock(&state->mutex);
+    if(reply){send_pkt(fd,reply,check_len(reply));goto done;}
+    upstream=connect_server(state->upstream_ip,state->upstream_port);
+    if(upstream<0 || !send_pkt(upstream,request,check_len(request)) || !read_pkt(upstream,&reply,&reply_length) || !analyse_pkt(reply,reply_length,&response) || !same_question(request,request_length,&query,reply,reply_length,&response))goto done;
+    pthread_mutex_lock(&state->mutex);
+    if(response.cacheable){push_cache(state->fp,state->cache,request,request_length,reply,reply_length,&response);rp_log_print(state->fp,response.domain,response.address);}
+    pthread_mutex_unlock(&state->mutex);
+    send_pkt(fd,reply,check_len(reply));
+done:
+    if(upstream>=0)close(upstream);
+    free(request);free(reply);close(fd);
 }
-
-// create space for buffer
-unsigned char* create_space(int length, unsigned char* buffer){
-	buffer = (unsigned char*) malloc (length);
-	assert(buffer);
-	return buffer;
+static void *API(void *delivery) {
+    struct mypara *job=delivery;server_state *state=job->server;process_req(job);free(job);
+    pthread_mutex_lock(&state->mutex);state->active--;pthread_cond_signal(&state->drained);pthread_mutex_unlock(&state->mutex);
+    return NULL;
 }
-
-// pack all process in one function to use the thread via API
-void process_req(FILE* fp, int newsockfd, unsigned char *req_buffer,unsigned char *rep_buffer, unsigned char *server_cache[CACHE_NUM], 
-	time_t expire_time[CACHE_NUM][LEN_BYTE], char** argv, char* filename){
-	// Initialse the varibles	
-	int msg_len = INITIAL, pkt_kind = INITIAL, upstream_sockfd = INITIAL;
-	int AAAA_check = FALSE, rp_check = FALSE,  cache_check = FALSE, cacheable_check= FALSE;
-	unsigned char pkt_len[LEN_BYTE];
-	char domain[BUFFER], address[BUFFER]; 
-	struct addrinfo  hints_upstream;
-	struct addrinfo  *rp = NULL, *servinfo = NULL;
-
-	// define a spin lock
-	pthread_spinlock_t spin;
-	// Read characters from the client, then process
-	msg_len = check_pkt_len(newsockfd, pkt_len);
-	// malloc the space for the buffer
-	req_buffer = create_space(msg_len + LEN_BYTE + STOP_POINT, req_buffer);
-	// read PKT
-	read_pkt(msg_len, pkt_len, req_buffer, newsockfd);
-
-	// record the receiving activities
-	pkt_kind = REC;
-	log_pkt(req_buffer, fp, &AAAA_check, &rp_check, &cacheable_check, pkt_kind, domain, address);
-	if(AAAA_check == FALSE){
-		rep_buffer = not_AAAA_rp(req_buffer);
-		// send pkt back to client
-		send_pkt(newsockfd, rep_buffer, msg_len); 
-	}else{
-		// check_cache and send response
-		check_cache(fp,server_cache, req_buffer, &cache_check, newsockfd, expire_time);		
-		if(cache_check == FALSE){	
-			res_log_print(fp, domain);												
-			// if the request is not in the cache
-			// connect the upstream server
-			connect_server(hints_upstream, &upstream_sockfd, rp, servinfo, argv[1], argv[2]);
-			// Send message to upstream server
-			send_pkt(upstream_sockfd, req_buffer, msg_len);
-			// receive the response from upstream server
-			msg_len = check_pkt_len(upstream_sockfd, pkt_len);
-			// malloc the space for the buffer
-			rep_buffer = create_space(msg_len + LEN_BYTE + STOP_POINT, rep_buffer);
-			assert(rep_buffer);
-			// read PKT from the upstream
-			read_pkt(msg_len, pkt_len, rep_buffer, upstream_sockfd);
-			// record the sending activities 
-			pkt_kind =RP;					
-			log_pkt(rep_buffer, fp, &AAAA_check, &rp_check, &cacheable_check, pkt_kind, domain, address);
-			// send pkt back to client			
-			msg_len = check_len(rep_buffer);
-			send_pkt(newsockfd, rep_buffer, msg_len); 
-			// push the last AAAA response into the cache 								
-			if(cacheable_check == TRUE){
-				pthread_spin_trylock(&spin);			
-				push_cache(fp, server_cache, req_buffer, rep_buffer, expire_time);
-				pthread_spin_unlock(&spin);	
-				if(rp_check == TRUE){
-					rp_log_print(fp, domain, address);
-				}
-			}else{ // if it is not cacheable, free malloced rp places
-				free(rep_buffer);
-				rep_buffer = NULL;
-			}
-			// print the log 
-			close(upstream_sockfd);
-		}
-	}
-	// free malloced receive places
-	free(req_buffer);
-	req_buffer = NULL;
-	freeaddrinfo(servinfo);
-	fclose(fp);
-	close(newsockfd);	
-	AAAA_check = FALSE; 
-	rp_check = FALSE;
-	cache_check = FALSE;
-	cacheable_check = FALSE;
-	msg_len = INITIAL;
-	fp = fopen(filename, "a");
-	pthread_spin_destroy(&spin);	
+int main(int argc,char **argv) {
+    if((argc!=3 && argc!=4) || !valid_port(argv[2]) || (argc==4 && !valid_port(argv[3]))) {fprintf(stderr,"usage: %s upstream-ip upstream-port [listen-port]\n",argv[0]);return 1;}
+    const char *bind_address=getenv("DNS_BIND_ADDRESS");if(!bind_address)bind_address="127.0.0.1";
+    server_state state={0};state.upstream_ip=argv[1];state.upstream_port=argv[2];
+    if(pthread_mutex_init(&state.mutex,NULL)!=0)return 1;
+    if(pthread_cond_init(&state.drained,NULL)!=0){pthread_mutex_destroy(&state.mutex);return 1;}
+    state.fp=fopen("dns_svr.log","a");if(!state.fp){perror("log");pthread_cond_destroy(&state.drained);pthread_mutex_destroy(&state.mutex);return 1;}
+    int fd=setup_socket(argc==4?argv[3]:"8053",bind_address);
+    if(fd<0){perror("listen");fclose(state.fp);pthread_cond_destroy(&state.drained);pthread_mutex_destroy(&state.mutex);return 1;}
+    struct sigaction action={0};action.sa_handler=stop_server;sigemptyset(&action.sa_mask);
+    sigaction(SIGTERM,&action,NULL);sigaction(SIGINT,&action,NULL);signal(SIGPIPE,SIG_IGN);
+    int result=0;
+    while(!stopping) {
+        struct pollfd ready={fd,POLLIN,0};
+        int polled=poll(&ready,1,100);
+        if(polled<0){if(errno==EINTR)continue;result=1;break;}
+        if(!polled || stopping)continue;
+        int client=accept(fd,NULL,NULL);
+        if(client<0){if(stopping)break;if(errno==EINTR)continue;perror("accept");result=1;break;}
+        struct mypara *job=malloc(sizeof(*job));
+        if(!job){close(client);continue;}
+        pthread_mutex_lock(&state.mutex);
+        if(state.active>=128){pthread_mutex_unlock(&state.mutex);close(client);free(job);continue;}
+        state.active++;pthread_mutex_unlock(&state.mutex);job->newsockfd=client;job->server=&state;
+        pthread_t tid;
+        if(pthread_create(&tid,NULL,API,job)!=0){close(client);free(job);pthread_mutex_lock(&state.mutex);state.active--;pthread_mutex_unlock(&state.mutex);}
+        else pthread_detach(tid);
+    }
+    close(fd);
+    pthread_mutex_lock(&state.mutex);
+    while(state.active)pthread_cond_wait(&state.drained,&state.mutex);
+    free_cache(state.cache);pthread_mutex_unlock(&state.mutex);
+    fclose(state.fp);pthread_cond_destroy(&state.drained);pthread_mutex_destroy(&state.mutex);return result;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
