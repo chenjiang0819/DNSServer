@@ -1,5 +1,13 @@
 # TCP AAAA DNS Proxy with Cache
 
+## Academic Context
+
+University: University of Melbourne  
+Course: COMP30023 Computer Systems  
+Year: 2021  
+Project type: individual
+
+
 ## Overview
 
 A handwritten POSIX C coursework TCP DNS proxy with per-connection workers, manual packet parsing, IPv6 AAAA forwarding, a five-entry cache and request/cache logging.
