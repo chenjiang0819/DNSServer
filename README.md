@@ -10,6 +10,8 @@ Year: 2021
 
 ## Implementation
 
+Socket setup builds on the course practical; Chen implemented the manual DNS parser, per-request workers and five-entry cache.
+
 Length-prefixed TCP request/response handling, DNS question/answer decoding, upstream forwarding, non-AAAA responses, cache eviction/expiry and timestamped logs.
 
 ## Technical approach
